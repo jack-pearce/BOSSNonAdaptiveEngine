@@ -484,7 +484,11 @@ private:
     assert(e.getSpanArguments().empty());
     assert(e.getDynamicArguments().size() >= 1);
     auto numDynamicArgs = e.getDynamicArguments().size();
-    if(numDynamicArgs == 1) {
+    if(numDynamicArgs == 1 ||
+       (numDynamicArgs == 2 &&
+        std::holds_alternative<ComplexExpression>(e.getDynamicArguments().at(1)) &&
+        std::get<ComplexExpression>(e.getDynamicArguments().at(1)).getHead().getName() ==
+            "PredicateID")) {
       Pred::Function pred = std::visit(
           [&e, &f](auto&& arg) -> Pred::Function {
             return
@@ -535,7 +539,9 @@ private:
       };
     } else {
       throw std::runtime_error("unsupported argument type in predicate");
-      return [](ExpressionArguments& /*unused*/) -> std::optional<ExpressionSpanArgument> { return {}; };
+      return [](ExpressionArguments& /*unused*/) -> std::optional<ExpressionSpanArgument> {
+        return {};
+      };
     }
   }
 
@@ -724,6 +730,7 @@ public:
       }
       return std::move(input);
     };
+
     (*this)["Plus"_] =
         []<NumericType FirstArgument>(
             ComplexExpressionWithStaticArguments<FirstArgument>&& input) -> Expression {
@@ -842,6 +849,62 @@ public:
       assert(input.getSpanArguments().empty());
       assert(input.getDynamicArguments().size() % 2 == 0);
       return std::move(input);
+    };
+
+    (*this)["DateObject"_] =
+        [](ComplexExpressionWithStaticArguments<std::string>&& input) -> Expression {
+      assert(input.getSpanArguments().empty());
+      assert(input.getDynamicArguments().empty());
+      auto str = get<0>(std::move(input).getStaticArguments());
+      std::istringstream iss;
+      iss.str(std::string(str));
+      struct std::tm tm = {};
+      iss >> std::get_time(&tm, "%Y-%m-%d");
+      auto t = std::mktime(&tm);
+      return (int32_t)std::chrono::duration_cast<std::chrono::days>(
+                 std::chrono::system_clock::from_time_t(t).time_since_epoch())
+          .count();
+    };
+
+    (*this)["Year"_] = [](ComplexExpressionWithStaticArguments<Symbol>&& input) -> Expression {
+      Pred::Function pred =
+          [pred1 = createLambdaArgument(get<0>(input.getStaticArguments()))](
+              ExpressionArguments& columns) mutable -> std::optional<ExpressionSpanArgument> {
+        auto arg1 = pred1(columns);
+        if(!arg1) {
+          return std::nullopt;
+        }
+        ExpressionSpanArgument span;
+        std::visit(
+            boss::utilities::overload(
+                [](auto&&) { throw std::runtime_error("Unsupported column type in Year"); },
+                [&span]<IntegralType T>(boss::expressions::atoms::Span<T>&& typedSpan) {
+                  std::vector<int32_t> output;
+                  output.reserve(typedSpan.size());
+
+                  // Correct version (but slower)
+                  /*std::chrono::system_clock::time_point epoch_start =
+                  std::chrono::system_clock::from_time_t(0); for(const auto& epochInDays :
+                  typedSpan) { std::chrono::system_clock::time_point date_time = epoch_start
+                  + std::chrono::hours(epochInDays * 24); std::time_t tt =
+                  std::chrono::system_clock::to_time_t(date_time); std::tm* gmt =
+                  std::gmtime(&tt); output.push_back(static_cast<int32_t>(gmt->tm_year +
+                  1900));
+                  }*/
+
+                  // Identical version used to that in the Velox engine for a fair comparison
+                  for(const auto& epochInDays : typedSpan) {
+                    output.push_back(static_cast<int32_t>(
+                        (static_cast<double>(epochInDays) + 719563.285) / 365.265)); // NOLINT
+                  }
+
+                  span = Span<int32_t>(std::vector(output));
+                }),
+            std::move(*arg1));
+        return span;
+      };
+      return PredWrapper(
+          std::make_unique<Pred>(std::move(pred), toBOSSExpression(std::move(input))));
     };
 
     (*this)["Project"_] = [](ComplexExpression&& inputExpr) -> Expression {
@@ -1253,21 +1316,39 @@ static boss::Expression evaluate(boss::Expression&& expr) {
               << utilities::injectDebugInfoToSpans(expr.clone(CloneReason::FOR_TESTING))
               << std::endl;
 #endif
-    while(std::holds_alternative<boss::ComplexExpression>(expr) &&
-          get<boss::ComplexExpression>(expr).getHead() == "Let"_) {
-      auto [head, unused_, dynamics, spans] =
-          std::move(get<boss::ComplexExpression>(expr)).decompose();
-      expr = std::move(dynamics.at(0));
-      auto letExpr = get<boss::ComplexExpression>(std::move(dynamics.at(1)));
-      if(letExpr.getHead().getName() == "Parallel") {
+    // If batch evaluating a Join then we can remove the let (Parallel_Batched) expression
+    if(std::holds_alternative<boss::ComplexExpression>(expr) &&
+       get<boss::ComplexExpression>(expr).getHead() == "Let"_) {
+      if(get<boss::ComplexExpression>(get<boss::ComplexExpression>(expr).getArguments().at(1))
+             .getHead()
+             .getName() == "Parallel_Batched") {
+        auto [head, unused_, dynamics, spans] =
+            std::move(get<boss::ComplexExpression>(expr)).decompose();
+        expr = std::move(dynamics.at(0));
+        auto letExpr = get<boss::ComplexExpression>(std::move(dynamics.at(1)));
         auto [parallelHead, unused1, parallelArgs, unused2] = std::move(letExpr).decompose();
         if(parallelArgs.empty()) {
           throw std::runtime_error("No constantsDOP value in parallel expression");
         }
         getEngineInstanceState().setVectorizedDOP(get<int32_t>(parallelArgs.at(0)));
+        return toBOSSExpression(evaluateInternal(std::move(expr)));
+      }
+    }
+    // Else part of an engine pipeline so we must leave the let expressions
+    if(std::holds_alternative<boss::ComplexExpression>(expr) &&
+       get<boss::ComplexExpression>(expr).getHead() == "Let"_) {
+      if(get<boss::ComplexExpression>(get<boss::ComplexExpression>(expr).getArguments().at(1))
+             .getHead()
+             .getName() == "Parallel") {
+        if(get<boss::ComplexExpression>(expr).getArguments().empty()) {
+          throw std::runtime_error("No constantsDOP value in parallel expression");
+        }
+        getEngineInstanceState().setVectorizedDOP(get<int32_t>(
+            get<boss::ComplexExpression>(get<boss::ComplexExpression>(expr).getArguments().at(1))
+                .getArguments()
+                .at(0)));
       } else {
-        throw std::runtime_error("Unexpected argument of 'Let' expression: " +
-                                 letExpr.getHead().getName());
+        throw std::runtime_error("Expected first argument of 'Let' expression to be 'Parallel'");
       }
     }
     return toBOSSExpression(evaluateInternal(std::move(expr)));
