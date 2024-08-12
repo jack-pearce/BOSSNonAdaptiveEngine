@@ -1,5 +1,8 @@
 #!/bin/bash
 
+# To be run in build directory
+# Paths to other repos need to be updated
+
 if [[ $EUID -ne 0 ]]; then
     echo "This script must be run as root (with sudo)."
     exit 1
