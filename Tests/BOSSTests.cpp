@@ -6,8 +6,6 @@
 #include <numeric>
 #include <variant>
 
-// #define DEFERRED_TO_OTHER_ENGINE
-
 using boss::Expression;
 using std::string;
 using std::literals::string_literals::operator""s;
