@@ -250,7 +250,7 @@ TEST_CASE("Join") {
   }
 }
 
-TEST_CASE("Join - multi-key join", "[hazard-adaptive-engine]") {
+TEST_CASE("Join - multi-key join") {
   auto engine = boss::engines::BootstrapEngine();
   REQUIRE(!librariesToTest.empty());
   auto eval = [&engine](boss::Expression&& expression) mutable {
